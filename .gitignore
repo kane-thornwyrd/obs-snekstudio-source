@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+
+# Python cache
+*.pyc
+
+# CMake and local build outputs
+build/
+dist/
+stage/
+
+# Arch packaging workdirs and artifacts
+packaging/arch/pkg/
+packaging/arch/src/
+packaging/arch/*.pkg.tar.zst
+packaging/arch/*.pkg.tar.zst.sig
+packaging/arch/*.tar.gz
+packaging/arch/.SRCINFO
+
+# Local editor state
+.vscode/

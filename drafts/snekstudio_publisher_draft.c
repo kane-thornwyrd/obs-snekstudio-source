@@ -1,0 +1,242 @@
+#include "snekstudio_publisher_draft.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include "snekstudio_frame_protocol.h"
+
+static void snekstudio_publisher_set_error(struct snekstudio_publisher *publisher, const char *format, ...)
+{
+	va_list args;
+	if (!publisher) {
+		return;
+	}
+
+	va_start(args, format);
+	vsnprintf(publisher->last_error, sizeof(publisher->last_error), format, args);
+	va_end(args);
+}
+
+static bool snekstudio_publisher_ensure_parent_dirs(const char *path, char *error_buffer, size_t error_buffer_size)
+{
+	char buffer[SNEKSTUDIO_PUBLISHER_PATH_MAX];
+	char *cursor;
+
+	if (!path || strlen(path) >= sizeof(buffer)) {
+		snprintf(error_buffer, error_buffer_size, "%s", "publisher path is missing or too long");
+		return false;
+	}
+
+	snprintf(buffer, sizeof(buffer), "%s", path);
+	for (cursor = buffer + 1; *cursor; cursor++) {
+		if (*cursor != '/') {
+			continue;
+		}
+
+		*cursor = '\0';
+		if (mkdir(buffer, 0755) != 0 && errno != EEXIST) {
+			snprintf(error_buffer, error_buffer_size, "mkdir failed: %s", strerror(errno));
+			return false;
+		}
+		*cursor = '/';
+	}
+
+	return true;
+}
+
+size_t snekstudio_publisher_required_size(uint32_t width, uint32_t height, uint32_t *stride_bytes_out)
+{
+	uint32_t stride_bytes = width * 4;
+	if (stride_bytes_out) {
+		*stride_bytes_out = stride_bytes;
+	}
+
+	return sizeof(struct snekstudio_frame_header) + ((size_t)stride_bytes * (size_t)height);
+}
+
+static void snekstudio_publisher_write_header(struct snekstudio_publisher *publisher, uint64_t write_sequence,
+	uint64_t frame_sequence, uint64_t timestamp_ns)
+{
+	struct snekstudio_frame_header *header = (struct snekstudio_frame_header *)publisher->mapping;
+	memset(header, 0, sizeof(*header));
+	memcpy(header->magic, SNEKSTUDIO_FRAME_MAGIC, sizeof(header->magic));
+	header->version = SNEKSTUDIO_FRAME_PROTOCOL_VERSION;
+	header->header_size = sizeof(*header);
+	header->width = publisher->width;
+	header->height = publisher->height;
+	header->stride_bytes = publisher->stride_bytes;
+	header->pixel_format = SNEKSTUDIO_PIXEL_FORMAT_BGRA8;
+	header->data_offset = sizeof(*header);
+	header->data_size = publisher->mapping_size - sizeof(*header);
+	header->write_sequence = write_sequence;
+	header->frame_sequence = frame_sequence;
+	header->timestamp_ns = timestamp_ns;
+	header->flags = SNEKSTUDIO_FRAME_FLAG_READY;
+}
+
+static bool snekstudio_publisher_remap(struct snekstudio_publisher *publisher)
+{
+	size_t required_size;
+	int fd;
+	void *mapping;
+	char mkdir_error[256] = {0};
+
+	if (!snekstudio_publisher_ensure_parent_dirs(publisher->path, mkdir_error, sizeof(mkdir_error))) {
+		snekstudio_publisher_set_error(publisher, "%s", mkdir_error);
+		return false;
+	}
+
+	required_size = snekstudio_publisher_required_size(publisher->width, publisher->height, &publisher->stride_bytes);
+	fd = open(publisher->path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+	if (fd < 0) {
+		snekstudio_publisher_set_error(publisher, "open failed: %s", strerror(errno));
+		return false;
+	}
+
+	if (ftruncate(fd, (off_t)required_size) != 0) {
+		snekstudio_publisher_set_error(publisher, "ftruncate failed: %s", strerror(errno));
+		close(fd);
+		return false;
+	}
+
+	mapping = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (mapping == MAP_FAILED) {
+		snekstudio_publisher_set_error(publisher, "mmap failed: %s", strerror(errno));
+		close(fd);
+		return false;
+	}
+
+	snekstudio_publisher_close(publisher);
+	publisher->fd = fd;
+	publisher->mapping = mapping;
+	publisher->mapping_size = required_size;
+	publisher->next_frame_sequence = 1;
+	publisher->frame_open = false;
+	snekstudio_publisher_write_header(publisher, 0, 0, 0);
+	return true;
+}
+
+bool snekstudio_publisher_init(struct snekstudio_publisher *publisher, const char *path, uint32_t width,
+	uint32_t height)
+{
+	if (!publisher || !path || width == 0 || height == 0) {
+		return false;
+	}
+
+	memset(publisher, 0, sizeof(*publisher));
+	publisher->fd = -1;
+	publisher->width = width;
+	publisher->height = height;
+	if (strlen(path) >= sizeof(publisher->path)) {
+		snekstudio_publisher_set_error(publisher, "%s", "publisher path is too long");
+		return false;
+	}
+
+	snprintf(publisher->path, sizeof(publisher->path), "%s", path);
+	return snekstudio_publisher_remap(publisher);
+}
+
+bool snekstudio_publisher_resize(struct snekstudio_publisher *publisher, uint32_t width, uint32_t height)
+{
+	if (!publisher || width == 0 || height == 0) {
+		return false;
+	}
+
+	publisher->width = width;
+	publisher->height = height;
+	return snekstudio_publisher_remap(publisher);
+}
+
+bool snekstudio_publisher_begin_frame(struct snekstudio_publisher *publisher,
+	struct snekstudio_publisher_frame *frame_out)
+{
+	uint64_t frame_sequence;
+
+	if (!publisher || !publisher->mapping || !frame_out || publisher->frame_open) {
+		return false;
+	}
+
+	frame_sequence = publisher->next_frame_sequence;
+	snekstudio_publisher_write_header(publisher, (frame_sequence * 2) - 1, frame_sequence, 0);
+	publisher->frame_open = true;
+	frame_out->pixels = publisher->mapping + sizeof(struct snekstudio_frame_header);
+	frame_out->bytes = publisher->mapping_size - sizeof(struct snekstudio_frame_header);
+	frame_out->width = publisher->width;
+	frame_out->height = publisher->height;
+	frame_out->stride_bytes = publisher->stride_bytes;
+	return true;
+}
+
+bool snekstudio_publisher_end_frame(struct snekstudio_publisher *publisher, uint64_t timestamp_ns)
+{
+	uint64_t frame_sequence;
+
+	if (!publisher || !publisher->mapping || !publisher->frame_open) {
+		return false;
+	}
+
+	frame_sequence = publisher->next_frame_sequence;
+	snekstudio_publisher_write_header(publisher, frame_sequence * 2, frame_sequence, timestamp_ns);
+	publisher->next_frame_sequence += 1;
+	publisher->frame_open = false;
+	return true;
+}
+
+bool snekstudio_publisher_publish_copy(struct snekstudio_publisher *publisher, const uint8_t *pixels,
+	size_t bytes, uint64_t timestamp_ns)
+{
+	struct snekstudio_publisher_frame frame;
+	if (!publisher || !pixels) {
+		return false;
+	}
+
+	if (!snekstudio_publisher_begin_frame(publisher, &frame)) {
+		return false;
+	}
+
+	if (bytes > frame.bytes) {
+		publisher->frame_open = false;
+		snekstudio_publisher_set_error(publisher, "frame payload is too large: %zu > %zu", bytes, frame.bytes);
+		return false;
+	}
+
+	memcpy(frame.pixels, pixels, bytes);
+	return snekstudio_publisher_end_frame(publisher, timestamp_ns);
+}
+
+void snekstudio_publisher_close(struct snekstudio_publisher *publisher)
+{
+	if (!publisher) {
+		return;
+	}
+
+	if (publisher->mapping) {
+		munmap(publisher->mapping, publisher->mapping_size);
+		publisher->mapping = NULL;
+	}
+
+	if (publisher->fd >= 0) {
+		close(publisher->fd);
+		publisher->fd = -1;
+	}
+
+	publisher->mapping_size = 0;
+	publisher->frame_open = false;
+}
+
+const char *snekstudio_publisher_last_error(const struct snekstudio_publisher *publisher)
+{
+	if (!publisher || !publisher->last_error[0]) {
+		return "";
+	}
+
+	return publisher->last_error;
+}

@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import math
+import mmap
+import os
+import pathlib
+import signal
+import struct
+import sys
+import time
+
+
+MAGIC = b"SNEKFB1\0"
+VERSION = 1
+PIXEL_FORMAT_BGRA8 = 1
+FLAG_READY = 1
+HEADER_STRUCT = struct.Struct("<8sIIIIIIIIQQQII56x")
+
+
+def default_frame_path() -> pathlib.Path:
+	runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+	return pathlib.Path(runtime_dir) / "snekstudio-source" / "demo-framebuffer.bin"
+
+
+def fill_rect(buffer: bytearray, width: int, height: int, x: int, y: int, rect_width: int, rect_height: int,
+	color: tuple[int, int, int, int]) -> None:
+	stride = width * 4
+	x0 = max(0, x)
+	y0 = max(0, y)
+	x1 = min(width, x + rect_width)
+	y1 = min(height, y + rect_height)
+	if x0 >= x1 or y0 >= y1:
+		return
+
+	pixel = bytes(color)
+	row_fill = pixel * (x1 - x0)
+	for row_index in range(y0, y1):
+		row_offset = row_index * stride + (x0 * 4)
+		buffer[row_offset : row_offset + len(row_fill)] = row_fill
+
+
+def draw_led_row(buffer: bytearray, width: int, height: int, frame_index: int) -> None:
+	for bit_index in range(8):
+		is_on = (frame_index >> bit_index) & 1
+		color = (40, 240, 90, 255) if is_on else (25, 25, 25, 255)
+		fill_rect(buffer, width, height, 18 + (bit_index * 28), 18, 20, 20, color)
+
+
+def build_frame(width: int, height: int, frame_index: int) -> bytearray:
+	stride = width * 4
+	buffer = bytearray(stride * height)
+	phase = frame_index / 24.0
+	bounce_size = max(min(width, height) // 5, 64)
+	bounce_x = int((math.sin(phase) * 0.5 + 0.5) * max(width - bounce_size, 1))
+	bounce_y = int((math.cos(phase * 0.7) * 0.5 + 0.5) * max(height - bounce_size, 1))
+	sweep_x = (frame_index * 13) % max(width, 1)
+	sweep_y = (frame_index * 9) % max(height, 1)
+	pulse = (math.sin(phase * 3.0) * 0.5) + 0.5
+
+	for y in range(height):
+		row = y * stride
+		for x in range(width):
+			offset = row + (x * 4)
+			blue = int(35 + (80 * x / max(width, 1)))
+			green = int(25 + (120 * y / max(height, 1)))
+			red = int(40 + (90 * ((x + y) / max(width + height, 1))))
+			alpha = 255
+
+			buffer[offset : offset + 4] = bytes((blue, green, red, alpha))
+
+	border = 8
+	border_blue = int(40 + pulse * 180)
+	border_green = int(60 + pulse * 100)
+	border_red = int(200 + pulse * 40)
+	fill_rect(buffer, width, height, 0, 0, width, border, (border_blue, border_green, border_red, 255))
+	fill_rect(buffer, width, height, 0, height - border, width, border, (border_blue, border_green, border_red, 255))
+	fill_rect(buffer, width, height, 0, 0, border, height, (border_blue, border_green, border_red, 255))
+	fill_rect(buffer, width, height, width - border, 0, border, height, (border_blue, border_green, border_red, 255))
+
+	fill_rect(buffer, width, height, sweep_x - 10, 0, 20, height, (255, 255, 255, 255))
+	fill_rect(buffer, width, height, 0, sweep_y - 10, width, 20, (255, 80, 220, 255))
+	fill_rect(buffer, width, height, bounce_x, bounce_y, bounce_size, bounce_size, (20, 230, 250, 255))
+	draw_led_row(buffer, width, height, frame_index)
+
+	return buffer
+
+
+def write_header(mapping: mmap.mmap, width: int, height: int, stride: int, data_size: int, write_seq: int,
+	frame_seq: int, timestamp_ns: int) -> None:
+	HEADER_STRUCT.pack_into(
+		mapping,
+		0,
+		MAGIC,
+		VERSION,
+		HEADER_STRUCT.size,
+		width,
+		height,
+		stride,
+		PIXEL_FORMAT_BGRA8,
+		HEADER_STRUCT.size,
+		data_size,
+		write_seq,
+		frame_seq,
+		timestamp_ns,
+		FLAG_READY,
+		0,
+	)
+
+
+def run_publisher(path: pathlib.Path, width: int, height: int, fps: float, max_frames: int | None) -> int:
+	stride = width * 4
+	data_size = stride * height
+	total_size = HEADER_STRUCT.size + data_size
+	path.parent.mkdir(parents=True, exist_ok=True)
+
+	with path.open("w+b") as handle:
+		handle.truncate(total_size)
+		with mmap.mmap(handle.fileno(), total_size, access=mmap.ACCESS_WRITE) as mapping:
+			frame_index = 0
+			running = True
+
+			def stop(_signal: int, _frame: object) -> None:
+				nonlocal running
+				running = False
+
+			signal.signal(signal.SIGINT, stop)
+			signal.signal(signal.SIGTERM, stop)
+
+			print(f"Publishing demo frames to {path}")
+			print(f"Resolution: {width}x{height} at {fps:.2f} FPS")
+			print("Keep this process running while OBS is open.")
+
+			next_frame_time = time.perf_counter()
+			while running:
+				pixels = build_frame(width, height, frame_index)
+				write_seq = (frame_index * 2) + 1
+				timestamp_ns = time.monotonic_ns()
+				write_header(mapping, width, height, stride, data_size, write_seq, frame_index + 1, timestamp_ns)
+				mapping[HEADER_STRUCT.size : HEADER_STRUCT.size + data_size] = pixels
+				write_header(mapping, width, height, stride, data_size, write_seq + 1, frame_index + 1, timestamp_ns)
+				mapping.flush()
+
+				frame_index += 1
+				if max_frames is not None and frame_index >= max_frames:
+					break
+
+				next_frame_time += 1.0 / fps
+				remaining = next_frame_time - time.perf_counter()
+				if remaining > 0:
+					time.sleep(remaining)
+
+	return 0
+
+
+def main() -> int:
+	parser = argparse.ArgumentParser(description="Publish demo frames for the SnekStudio OBS source MVP.")
+	parser.add_argument("--path", type=pathlib.Path, default=default_frame_path(), help="Shared frame file path.")
+	parser.add_argument("--width", type=int, default=640, help="Frame width in pixels.")
+	parser.add_argument("--height", type=int, default=360, help="Frame height in pixels.")
+	parser.add_argument("--fps", type=float, default=30.0, help="Frames per second.")
+	parser.add_argument("--frames", type=int, default=None, help="Number of frames to publish before exiting.")
+	args = parser.parse_args()
+
+	if args.width <= 0 or args.height <= 0:
+		print("Width and height must be positive integers.", file=sys.stderr)
+		return 2
+
+	if args.fps <= 0:
+		print("FPS must be greater than zero.", file=sys.stderr)
+		return 2
+
+	return run_publisher(args.path, args.width, args.height, args.fps, args.frames)
+
+
+if __name__ == "__main__":
+	raise SystemExit(main())

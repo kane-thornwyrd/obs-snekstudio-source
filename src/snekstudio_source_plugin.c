@@ -1,0 +1,638 @@
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <obs/obs-module.h>
+#include <obs/util/base.h>
+#include <obs/util/platform.h>
+#include <obs/util/threading.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include "snekstudio_frame_protocol.h"
+
+OBS_DECLARE_MODULE()
+OBS_MODULE_AUTHOR("GitHub Copilot")
+
+#define SNEK_SOURCE_ID "snekstudio_source"
+#define SNEK_PATH_SETTING "frame_path"
+#define SNEK_FALLBACK_WIDTH_SETTING "fallback_width"
+#define SNEK_FALLBACK_HEIGHT_SETTING "fallback_height"
+#define SNEK_STATUS_INFO_PROPERTY "status_info"
+#define SNEK_STATUS_REFRESH_PROPERTY "refresh_status"
+#define SNEK_RECONNECT_INTERVAL_NS 1000000000ULL
+
+struct snekstudio_source {
+	obs_source_t *source;
+	char *frame_path;
+	uint32_t fallback_width;
+	uint32_t fallback_height;
+
+	pthread_mutex_t mutex;
+	int mapped_fd;
+	uint8_t *mapped_bytes;
+	size_t mapped_size;
+	bool connected;
+
+	uint32_t current_width;
+	uint32_t current_height;
+	uint32_t current_stride;
+	uint64_t last_frame_sequence;
+	uint64_t last_header_timestamp_ns;
+	uint64_t last_observed_frame_sequence;
+	uint64_t total_frames_copied;
+	uint64_t next_reconnect_ns;
+	uint64_t last_error_log_ns;
+	bool logged_connected;
+
+	uint8_t *frame_copy;
+	size_t frame_copy_size;
+	bool pending_upload;
+
+	gs_texture_t *texture;
+	uint32_t texture_width;
+	uint32_t texture_height;
+};
+
+static bool snekstudio_status_refresh_clicked(obs_properties_t *properties, obs_property_t *property, void *data);
+
+static const char *snekstudio_source_get_name(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return "SnekStudio Source (MVP)";
+}
+
+static char *snekstudio_default_frame_path(void)
+{
+	const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+	const char *base_dir = runtime_dir && *runtime_dir ? runtime_dir : "/tmp";
+	const char *suffix = "/snekstudio-source/demo-framebuffer.bin";
+	size_t length = strlen(base_dir) + strlen(suffix) + 1;
+	char *path = bzalloc(length);
+	if (!path) {
+		return NULL;
+	}
+
+	snprintf(path, length, "%s%s", base_dir, suffix);
+	return path;
+}
+
+static void snekstudio_log_rate_limited(struct snekstudio_source *context, int level, const char *format, ...)
+{
+	uint64_t now = os_gettime_ns();
+	if (now < context->last_error_log_ns + SNEK_RECONNECT_INTERVAL_NS) {
+		return;
+	}
+
+	context->last_error_log_ns = now;
+
+	va_list args;
+	va_start(args, format);
+	blogva(level, format, args);
+	va_end(args);
+}
+
+static void snekstudio_disconnect_locked(struct snekstudio_source *context)
+{
+	if (context->mapped_bytes) {
+		munmap(context->mapped_bytes, context->mapped_size);
+		context->mapped_bytes = NULL;
+	}
+
+	if (context->mapped_fd >= 0) {
+		close(context->mapped_fd);
+		context->mapped_fd = -1;
+	}
+
+	context->mapped_size = 0;
+	context->connected = false;
+	context->logged_connected = false;
+	context->current_width = 0;
+	context->current_height = 0;
+	context->current_stride = 0;
+	context->last_frame_sequence = 0;
+	context->pending_upload = false;
+	context->next_reconnect_ns = os_gettime_ns() + SNEK_RECONNECT_INTERVAL_NS;
+}
+
+static bool snekstudio_validate_header(const struct snekstudio_frame_header *header, size_t mapped_size,
+	uint32_t *width, uint32_t *height, uint32_t *stride, uint32_t *data_size)
+{
+	if (!header) {
+		return false;
+	}
+
+	if (memcmp(header->magic, SNEKSTUDIO_FRAME_MAGIC, sizeof(header->magic)) != 0) {
+		return false;
+	}
+
+	if (header->version != SNEKSTUDIO_FRAME_PROTOCOL_VERSION) {
+		return false;
+	}
+
+	if (header->header_size != sizeof(*header)) {
+		return false;
+	}
+
+	if (header->pixel_format != SNEKSTUDIO_PIXEL_FORMAT_BGRA8) {
+		return false;
+	}
+
+	if ((header->flags & SNEKSTUDIO_FRAME_FLAG_READY) == 0) {
+		return false;
+	}
+
+	if (header->width == 0 || header->height == 0 || header->stride_bytes == 0) {
+		return false;
+	}
+
+	if (header->data_offset < sizeof(*header)) {
+		return false;
+	}
+
+	if (header->data_size == 0) {
+		return false;
+	}
+
+	if (header->data_offset > mapped_size || header->data_size > mapped_size - header->data_offset) {
+		return false;
+	}
+
+	if ((uint64_t)header->stride_bytes * (uint64_t)header->height > header->data_size) {
+		return false;
+	}
+
+	*width = header->width;
+	*height = header->height;
+	*stride = header->stride_bytes;
+	*data_size = header->data_size;
+	return true;
+}
+
+static bool snekstudio_try_connect_locked(struct snekstudio_source *context)
+{
+	struct stat stat_result = {0};
+	int mapped_fd;
+	void *mapped_bytes;
+	struct snekstudio_frame_header *header;
+	uint32_t width;
+	uint32_t height;
+	uint32_t stride;
+	uint32_t data_size;
+
+	if (!context->frame_path || !*context->frame_path) {
+		return false;
+	}
+
+	mapped_fd = open(context->frame_path, O_RDONLY | O_CLOEXEC);
+	if (mapped_fd < 0) {
+		return false;
+	}
+
+	if (fstat(mapped_fd, &stat_result) != 0 || stat_result.st_size < (off_t)sizeof(*header)) {
+		close(mapped_fd);
+		return false;
+	}
+
+	mapped_bytes = mmap(NULL, (size_t)stat_result.st_size, PROT_READ, MAP_SHARED, mapped_fd, 0);
+	if (mapped_bytes == MAP_FAILED) {
+		close(mapped_fd);
+		return false;
+	}
+
+	header = mapped_bytes;
+	if (!snekstudio_validate_header(header, (size_t)stat_result.st_size, &width, &height, &stride, &data_size)) {
+		munmap(mapped_bytes, (size_t)stat_result.st_size);
+		close(mapped_fd);
+		return false;
+	}
+
+	context->mapped_fd = mapped_fd;
+	context->mapped_bytes = mapped_bytes;
+	context->mapped_size = (size_t)stat_result.st_size;
+	context->connected = true;
+	context->current_width = width;
+	context->current_height = height;
+	context->current_stride = stride;
+	context->last_observed_frame_sequence = header->frame_sequence;
+	context->last_header_timestamp_ns = header->timestamp_ns;
+	context->next_reconnect_ns = 0;
+
+	if (!context->logged_connected) {
+		blog(LOG_INFO, "[snekstudio-source] connected to frame stream: %s", context->frame_path);
+		context->logged_connected = true;
+	}
+
+	return true;
+}
+
+static bool snekstudio_try_copy_frame_locked(struct snekstudio_source *context)
+{
+	struct snekstudio_frame_header *header;
+	const uint8_t *payload;
+	uint64_t write_sequence_before;
+	uint64_t write_sequence_after;
+	uint64_t frame_sequence;
+	uint32_t width;
+	uint32_t height;
+	uint32_t stride;
+	uint32_t data_size;
+	size_t required_size;
+	int attempt;
+
+	if (!context->mapped_bytes) {
+		return false;
+	}
+
+	header = (struct snekstudio_frame_header *)context->mapped_bytes;
+
+	for (attempt = 0; attempt < 3; attempt++) {
+		write_sequence_before = header->write_sequence;
+		if ((write_sequence_before & 1u) != 0u) {
+			continue;
+		}
+
+		if (!snekstudio_validate_header(header, context->mapped_size, &width, &height, &stride, &data_size)) {
+			return false;
+		}
+
+		context->last_observed_frame_sequence = header->frame_sequence;
+		context->last_header_timestamp_ns = header->timestamp_ns;
+		frame_sequence = header->frame_sequence;
+		if (frame_sequence == context->last_frame_sequence) {
+			context->current_width = width;
+			context->current_height = height;
+			context->current_stride = stride;
+			return true;
+		}
+
+		required_size = (size_t)stride * (size_t)height;
+		if (required_size == 0 || required_size > data_size) {
+			return false;
+		}
+
+		if (required_size > context->frame_copy_size) {
+			uint8_t *replacement = brealloc(context->frame_copy, required_size);
+			if (!replacement) {
+				snekstudio_log_rate_limited(context, LOG_ERROR,
+					"[snekstudio-source] failed to allocate %zu bytes for frame copy", required_size);
+				return false;
+			}
+
+			context->frame_copy = replacement;
+			context->frame_copy_size = required_size;
+		}
+
+		payload = context->mapped_bytes + header->data_offset;
+		memcpy(context->frame_copy, payload, required_size);
+
+		write_sequence_after = header->write_sequence;
+		if (write_sequence_before != write_sequence_after || (write_sequence_after & 1u) != 0u) {
+			continue;
+		}
+
+		context->current_width = width;
+		context->current_height = height;
+		context->current_stride = stride;
+		context->last_frame_sequence = frame_sequence;
+		context->total_frames_copied += 1;
+		context->pending_upload = true;
+		return true;
+	}
+
+	return false;
+}
+
+static void snekstudio_destroy_texture(struct snekstudio_source *context)
+{
+	if (!context->texture) {
+		return;
+	}
+
+	obs_enter_graphics();
+	gs_texture_destroy(context->texture);
+	obs_leave_graphics();
+	context->texture = NULL;
+	context->texture_width = 0;
+	context->texture_height = 0;
+}
+
+static void snekstudio_build_status_text(struct snekstudio_source *context, char *buffer, size_t buffer_size,
+	enum obs_text_info_type *info_type)
+{
+	bool connected = false;
+	bool pending_upload = false;
+	bool texture_cached = false;
+	uint32_t width = 0;
+	uint32_t height = 0;
+	uint32_t stride = 0;
+	uint64_t frame_sequence = 0;
+	uint64_t timestamp_ns = 0;
+	uint64_t copied_frames = 0;
+	uint64_t reconnect_ns = 0;
+	size_t mapped_size = 0;
+	char path[512] = {0};
+	const char *state = "waiting for stream";
+
+	if (!context) {
+		if (info_type) {
+			*info_type = OBS_TEXT_INFO_WARNING;
+		}
+		snprintf(buffer, buffer_size, "%s", "State: unavailable\nSource data has not been created yet.");
+		return;
+	}
+
+	pthread_mutex_lock(&context->mutex);
+	connected = context->connected;
+	pending_upload = context->pending_upload;
+	texture_cached = context->texture != NULL;
+	width = context->current_width ? context->current_width : context->fallback_width;
+	height = context->current_height ? context->current_height : context->fallback_height;
+	stride = context->current_stride;
+	frame_sequence = context->last_observed_frame_sequence;
+	timestamp_ns = context->last_header_timestamp_ns;
+	copied_frames = context->total_frames_copied;
+	reconnect_ns = context->next_reconnect_ns;
+	mapped_size = context->mapped_size;
+	if (context->frame_path && *context->frame_path) {
+		snprintf(path, sizeof(path), "%s", context->frame_path);
+	}
+	pthread_mutex_unlock(&context->mutex);
+
+	if (connected) {
+		state = "connected";
+		if (info_type) {
+			*info_type = OBS_TEXT_INFO_NORMAL;
+		}
+	} else if (frame_sequence > 0 || texture_cached) {
+		state = "waiting for stream (cached frame visible)";
+		if (info_type) {
+			*info_type = OBS_TEXT_INFO_WARNING;
+		}
+	} else {
+		state = "waiting for stream";
+		if (info_type) {
+			*info_type = OBS_TEXT_INFO_WARNING;
+		}
+	}
+
+	snprintf(
+		buffer,
+		buffer_size,
+		"State: %s\n"
+		"Path: %s\n"
+		"Resolution: %ux%u\n"
+		"Stride: %u\n"
+		"Last frame sequence: %" PRIu64 "\n"
+		"Last header timestamp: %" PRIu64 "\n"
+		"Frames copied: %" PRIu64 "\n"
+		"Mapped bytes: %zu\n"
+		"Texture cached: %s\n"
+		"Pending upload: %s\n"
+		"Next reconnect ns: %" PRIu64,
+		state,
+		path[0] ? path : "<unset>",
+		width,
+		height,
+		stride,
+		frame_sequence,
+		timestamp_ns,
+		copied_frames,
+		mapped_size,
+		texture_cached ? "yes" : "no",
+		pending_upload ? "yes" : "no",
+		reconnect_ns);
+}
+
+static bool snekstudio_update_settings(struct snekstudio_source *context, obs_data_t *settings)
+{
+	const char *frame_path = obs_data_get_string(settings, SNEK_PATH_SETTING);
+	char *copied_path = frame_path && *frame_path ? bstrdup(frame_path) : snekstudio_default_frame_path();
+	bool path_changed;
+
+	pthread_mutex_lock(&context->mutex);
+	path_changed = ((context->frame_path == NULL) != (copied_path == NULL)) ||
+		(context->frame_path && copied_path && strcmp(context->frame_path, copied_path) != 0);
+	bfree(context->frame_path);
+	context->frame_path = copied_path;
+	context->fallback_width = (uint32_t)obs_data_get_int(settings, SNEK_FALLBACK_WIDTH_SETTING);
+	context->fallback_height = (uint32_t)obs_data_get_int(settings, SNEK_FALLBACK_HEIGHT_SETTING);
+	if (path_changed) {
+		snekstudio_disconnect_locked(context);
+		context->next_reconnect_ns = 0;
+	}
+	pthread_mutex_unlock(&context->mutex);
+	blog(LOG_INFO, "[snekstudio-source] source settings updated");
+	return path_changed;
+}
+
+static void *snekstudio_source_create(obs_data_t *settings, obs_source_t *source)
+{
+	struct snekstudio_source *context = bzalloc(sizeof(*context));
+	if (!context) {
+		return NULL;
+	}
+
+	context->source = source;
+	context->mapped_fd = -1;
+	context->fallback_width = 1280;
+	context->fallback_height = 720;
+	pthread_mutex_init(&context->mutex, NULL);
+
+	(void)snekstudio_update_settings(context, settings);
+	return context;
+}
+
+static void snekstudio_source_destroy(void *data)
+{
+	struct snekstudio_source *context = data;
+	if (!context) {
+		return;
+	}
+
+	snekstudio_destroy_texture(context);
+	pthread_mutex_lock(&context->mutex);
+	snekstudio_disconnect_locked(context);
+	bfree(context->frame_copy);
+	context->frame_copy = NULL;
+	context->frame_copy_size = 0;
+	bfree(context->frame_path);
+	context->frame_path = NULL;
+	pthread_mutex_unlock(&context->mutex);
+	pthread_mutex_destroy(&context->mutex);
+	bfree(context);
+}
+
+static void snekstudio_source_update(void *data, obs_data_t *settings)
+{
+	struct snekstudio_source *context = data;
+	bool path_changed = snekstudio_update_settings(context, settings);
+	if (path_changed) {
+		snekstudio_destroy_texture(context);
+	}
+}
+
+static uint32_t snekstudio_source_get_width(void *data)
+{
+	struct snekstudio_source *context = data;
+	uint32_t width;
+
+	pthread_mutex_lock(&context->mutex);
+	width = context->current_width ? context->current_width : context->fallback_width;
+	pthread_mutex_unlock(&context->mutex);
+
+	return width;
+}
+
+static uint32_t snekstudio_source_get_height(void *data)
+{
+	struct snekstudio_source *context = data;
+	uint32_t height;
+
+	pthread_mutex_lock(&context->mutex);
+	height = context->current_height ? context->current_height : context->fallback_height;
+	pthread_mutex_unlock(&context->mutex);
+
+	return height;
+}
+
+static void snekstudio_source_get_defaults(obs_data_t *settings)
+{
+	char *default_path = snekstudio_default_frame_path();
+	obs_data_set_default_string(settings, SNEK_PATH_SETTING, default_path ? default_path : "");
+	obs_data_set_default_int(settings, SNEK_FALLBACK_WIDTH_SETTING, 1280);
+	obs_data_set_default_int(settings, SNEK_FALLBACK_HEIGHT_SETTING, 720);
+	bfree(default_path);
+}
+
+static obs_properties_t *snekstudio_source_get_properties(void *data)
+{
+	UNUSED_PARAMETER(data);
+	obs_properties_t *properties = obs_properties_create();
+	char status_text[1024];
+	enum obs_text_info_type info_type = OBS_TEXT_INFO_WARNING;
+	obs_property_t *status_property;
+
+	snekstudio_build_status_text(data, status_text, sizeof(status_text), &info_type);
+	status_property = obs_properties_add_text(properties, SNEK_STATUS_INFO_PROPERTY, status_text, OBS_TEXT_INFO);
+	obs_property_text_set_info_type(status_property, info_type);
+	obs_property_text_set_info_word_wrap(status_property, true);
+	obs_property_text_set_monospace(status_property, true);
+	obs_properties_add_button(properties, SNEK_STATUS_REFRESH_PROPERTY, "Refresh status", snekstudio_status_refresh_clicked);
+
+	obs_properties_add_path(properties, SNEK_PATH_SETTING, "Frame buffer path", OBS_PATH_FILE,
+		"All files (*.*)", NULL);
+	obs_properties_add_int(properties, SNEK_FALLBACK_WIDTH_SETTING, "Fallback width", 16, 8192, 1);
+	obs_properties_add_int(properties, SNEK_FALLBACK_HEIGHT_SETTING, "Fallback height", 16, 8192, 1);
+	return properties;
+}
+
+static void snekstudio_source_video_tick(void *data, float seconds)
+{
+	struct snekstudio_source *context = data;
+	uint64_t now = os_gettime_ns();
+
+	UNUSED_PARAMETER(seconds);
+
+	pthread_mutex_lock(&context->mutex);
+	if (!context->connected && now >= context->next_reconnect_ns) {
+		if (!snekstudio_try_connect_locked(context)) {
+			snekstudio_log_rate_limited(context, LOG_WARNING,
+				"[snekstudio-source] waiting for frame stream: %s",
+				context->frame_path ? context->frame_path : "<unset>");
+			context->next_reconnect_ns = now + SNEK_RECONNECT_INTERVAL_NS;
+		}
+	}
+
+	if (context->connected && !snekstudio_try_copy_frame_locked(context)) {
+		snekstudio_log_rate_limited(context, LOG_WARNING,
+			"[snekstudio-source] frame stream became unreadable, reconnecting");
+		snekstudio_disconnect_locked(context);
+	}
+	pthread_mutex_unlock(&context->mutex);
+}
+
+static bool snekstudio_status_refresh_clicked(obs_properties_t *properties, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(properties);
+	UNUSED_PARAMETER(property);
+	UNUSED_PARAMETER(data);
+	return true;
+}
+
+static void snekstudio_source_video_render(void *data, gs_effect_t *effect)
+{
+	struct snekstudio_source *context = data;
+	uint32_t width;
+	uint32_t height;
+	uint32_t stride;
+	uint8_t *frame_copy = NULL;
+	bool pending_upload;
+
+	UNUSED_PARAMETER(effect);
+
+	pthread_mutex_lock(&context->mutex);
+	width = context->current_width;
+	height = context->current_height;
+	stride = context->current_stride;
+	pending_upload = context->pending_upload;
+	if (pending_upload && context->frame_copy && context->frame_copy_size >= (size_t)stride * (size_t)height) {
+		frame_copy = bmemdup(context->frame_copy, (size_t)stride * (size_t)height);
+		context->pending_upload = false;
+	}
+	pthread_mutex_unlock(&context->mutex);
+
+	if (width == 0 || height == 0) {
+		width = context->fallback_width;
+		height = context->fallback_height;
+	}
+
+	if (frame_copy && (!context->texture || context->texture_width != width || context->texture_height != height)) {
+		snekstudio_destroy_texture(context);
+		obs_enter_graphics();
+		context->texture = gs_texture_create(width, height, GS_BGRA, 1, NULL, GS_DYNAMIC);
+		obs_leave_graphics();
+		context->texture_width = width;
+		context->texture_height = height;
+	}
+
+	if (frame_copy && context->texture) {
+		gs_texture_set_image(context->texture, frame_copy, stride, false);
+	}
+
+	bfree(frame_copy);
+
+	if (context->texture) {
+		obs_source_draw(context->texture, 0, 0, width, height, false);
+	}
+}
+
+static struct obs_source_info snekstudio_source_info = {
+	.id = SNEK_SOURCE_ID,
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_VIDEO,
+	.get_name = snekstudio_source_get_name,
+	.create = snekstudio_source_create,
+	.destroy = snekstudio_source_destroy,
+	.get_width = snekstudio_source_get_width,
+	.get_height = snekstudio_source_get_height,
+	.get_defaults = snekstudio_source_get_defaults,
+	.get_properties = snekstudio_source_get_properties,
+	.update = snekstudio_source_update,
+	.video_tick = snekstudio_source_video_tick,
+	.video_render = snekstudio_source_video_render,
+	.icon_type = OBS_ICON_TYPE_CUSTOM,
+};
+
+bool obs_module_load(void)
+{
+	obs_register_source(&snekstudio_source_info);
+	blog(LOG_INFO, "[snekstudio-source] module loaded");
+	return true;
+}

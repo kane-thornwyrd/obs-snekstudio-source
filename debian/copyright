@@ -1,0 +1,8 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: obs-snekstudio-source
+
+Files: *
+Copyright: 2026 project contributors
+License: none
+ This project does not currently declare a redistributable upstream license.
+ Review and clarify licensing before distributing packages publicly.

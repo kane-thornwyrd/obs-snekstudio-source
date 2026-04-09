@@ -1,0 +1,15 @@
+Source: obs-snekstudio-source
+Section: video
+Priority: optional
+Maintainer: Local Packager <nobody@example.invalid>
+Build-Depends: debhelper-compat (= 13), cmake, pkg-config, libobs-dev, python3
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: obs-snekstudio-source
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends}, obs-studio, python3
+Description: OBS Studio plugin and demo publisher for cooperative SnekStudio capture
+ This package installs the SnekStudio OBS source plugin, the reference
+ shared-memory frame protocol header, and a demo publisher binary used for
+ local testing before the real SnekStudio-side integration exists.

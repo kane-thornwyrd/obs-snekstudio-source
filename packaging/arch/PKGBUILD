@@ -1,0 +1,28 @@
+# Maintainer: Local Packager <nobody@example.invalid>
+
+_pkgbuild_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+pkgname=obs-snekstudio-source
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="OBS Studio plugin and demo publisher for cooperative SnekStudio capture"
+arch=('x86_64')
+url='https://example.invalid/replace-with-upstream-homepage'
+license=('LicenseRef-UPSTREAM-NO-LICENSE')
+depends=('obs-studio' 'python')
+makedepends=('cmake' 'pkgconf')
+source=("${pkgname}-${pkgver}.tar.gz::file://${_pkgbuild_dir}/../../dist/${pkgname}-${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+	cmake -S "${srcdir}/${pkgname}-${pkgver}" \
+		-B build \
+		-DCMAKE_BUILD_TYPE=None \
+		-DCMAKE_INSTALL_PREFIX=/usr
+	cmake --build build
+}
+
+package() {
+	DESTDIR="${pkgdir}" cmake --install build
+	install -Dm644 "${_pkgbuild_dir}/UPSTREAM-LICENSE-NOTICE" -t "${pkgdir}/usr/share/licenses/${pkgname}/"
+}

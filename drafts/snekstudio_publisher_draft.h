@@ -1,0 +1,42 @@
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifndef SNEKSTUDIO_PUBLISHER_PATH_MAX
+#define SNEKSTUDIO_PUBLISHER_PATH_MAX 4096
+#endif
+
+struct snekstudio_publisher_frame {
+	uint8_t *pixels;
+	size_t bytes;
+	uint32_t width;
+	uint32_t height;
+	uint32_t stride_bytes;
+};
+
+struct snekstudio_publisher {
+	int fd;
+	char path[SNEKSTUDIO_PUBLISHER_PATH_MAX];
+	uint8_t *mapping;
+	size_t mapping_size;
+	uint32_t width;
+	uint32_t height;
+	uint32_t stride_bytes;
+	uint64_t next_frame_sequence;
+	bool frame_open;
+	char last_error[256];
+};
+
+size_t snekstudio_publisher_required_size(uint32_t width, uint32_t height, uint32_t *stride_bytes_out);
+bool snekstudio_publisher_init(struct snekstudio_publisher *publisher, const char *path, uint32_t width,
+	uint32_t height);
+bool snekstudio_publisher_resize(struct snekstudio_publisher *publisher, uint32_t width, uint32_t height);
+bool snekstudio_publisher_begin_frame(struct snekstudio_publisher *publisher,
+	struct snekstudio_publisher_frame *frame_out);
+bool snekstudio_publisher_end_frame(struct snekstudio_publisher *publisher, uint64_t timestamp_ns);
+bool snekstudio_publisher_publish_copy(struct snekstudio_publisher *publisher, const uint8_t *pixels,
+	size_t bytes, uint64_t timestamp_ns);
+void snekstudio_publisher_close(struct snekstudio_publisher *publisher);
+const char *snekstudio_publisher_last_error(const struct snekstudio_publisher *publisher);

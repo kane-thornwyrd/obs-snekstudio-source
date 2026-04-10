@@ -32,7 +32,8 @@ stdenv.mkDerivation rec {
 
   meta = with lib; {
     description = "OBS Studio plugin and demo publisher for cooperative SnekStudio capture";
-    license = licenses.unfree;
+    homepage = "https://github.com/kane-thornwyrd/obs-snekstudio-source";
+    license = licenses.gpl3Plus;
     platforms = platforms.linux;
     mainProgram = "snekstudio-demo-publisher";
   };

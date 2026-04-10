@@ -2,6 +2,8 @@
 
 This repository now contains a cooperative capture MVP for SnekStudio-specific OBS integration.
 
+License: `GPL-3.0-or-later`
+
 What is included:
 
 - A real OBS input source plugin built against `libobs`.
@@ -33,6 +35,7 @@ That produces:
 - `stage/lib/obs-plugins/snekstudio-source.so`
 - `stage/bin/snekstudio-demo-publisher`
 - `stage/include/snekstudio-source/snekstudio_frame_protocol.h`
+- `stage/share/licenses/obs-snekstudio-source/LICENSE`
 - `stage/share/obs/obs-plugins/snekstudio-source/snekstudio_frame_protocol.h`
 - `stage/share/doc/obs-snekstudio-source/MVP.md`
 - `stage/share/doc/obs-snekstudio-source/SPEC.md`

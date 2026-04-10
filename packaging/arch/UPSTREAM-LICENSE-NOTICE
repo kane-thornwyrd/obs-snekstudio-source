@@ -1,8 +1,0 @@
-The upstream project does not currently declare a distributable software license.
-
-This file exists only so the local draft package has a matching custom license
-notice for validation purposes.
-
-Do not use this placeholder for an AUR submission. Replace the PKGBUILD license
-field and the installed license material with the real upstream software license
-before publishing the package.

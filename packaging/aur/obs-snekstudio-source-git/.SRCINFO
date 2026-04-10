@@ -1,0 +1,19 @@
+pkgbase = obs-snekstudio-source-git
+	pkgdesc = OBS Studio plugin and demo publisher for cooperative SnekStudio capture
+	pkgver = r0.unknown
+	pkgrel = 1
+	url = https://github.com/kane-thornwyrd/obs-snekstudio-source
+	install = obs-snekstudio-source.install
+	arch = x86_64
+	license = GPL-3.0-or-later
+	makedepends = cmake
+	makedepends = git
+	makedepends = pkgconf
+	depends = obs-studio
+	depends = python
+	provides = obs-snekstudio-source
+	conflicts = obs-snekstudio-source
+	source = obs-snekstudio-source::git+https://github.com/kane-thornwyrd/obs-snekstudio-source.git
+	sha256sums = SKIP
+
+pkgname = obs-snekstudio-source-git

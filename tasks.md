@@ -42,8 +42,11 @@
 - [x] Validate a repeatable local build for the OBS plugin and staged install layout.
 - [x] Add source properties status diagnostics so stream state can be inspected without reading raw frame headers.
 - [x] Draft an embeddable SnekStudio-side publisher reference implementation against the shared protocol.
-- [ ] Replace the demo publisher with a real SnekStudio-side module.
-- [ ] Add reconnect and invalidation behavior polish inside the OBS plugin.
+- [x] Evaluate a pure GDScript SnekStudio mod path against the real SnekStudio codebase.
+- [x] Prototype an in-tree `OBSFramePublisher` SnekStudio mod in the local cloned repo.
+- [x] Replace the demo publisher with a real SnekStudio-side module.
+- [x] Add reconnect and invalidation behavior polish inside the OBS plugin.
+- [x] Add a fixed-resolution publishing mode for the SnekStudio module.
 
 ## Phase 3: Packaging
 
@@ -51,13 +54,22 @@
 - [x] Ensure plugin data installs to `/usr/share/obs/obs-plugins/<plugin-name>`.
 - [x] Add a packaging recipe suitable for the user's Arch setup.
 - [x] Add draft packaging definitions for Debian and NixOS.
+- [x] Add a GitHub Actions workflow that builds and publishes release artifacts.
+- [x] Prepare actual AUR repository contents for `obs-snekstudio-source-git`.
 
 ## Phase 4: Validation
 
 - [x] Test add-source flow in OBS on Wayland.
+- [x] Test end-to-end frame publication from the SnekStudio `OBSFramePublisher` mod into the OBS plugin.
 - [ ] Test capture stability during resize, hide, and close events.
 - [ ] Test failure behavior when the target becomes invalid.
 - [ ] Document known compositor or portal limitations.
+
+## Upstream Preparation
+
+- [x] Draft an upstream-ready PR shape for the SnekStudio OBS publisher work.
+- [x] Prepare an external mod packaging path so SnekStudio-side work can stay out of the cloned upstream tree.
+- [x] Prepare a self-contained Godot Asset Library package for the SnekStudio OBSFramePublisher mod.
 
 ## Decision Rule
 

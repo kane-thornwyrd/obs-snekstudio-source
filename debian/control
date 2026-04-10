@@ -1,7 +1,8 @@
 Source: obs-snekstudio-source
 Section: video
 Priority: optional
-Maintainer: Local Packager <nobody@example.invalid>
+Maintainer: Jean-Cedric Therond <jean.cedric.t+github@gmail.com>
+Homepage: https://github.com/kane-thornwyrd/obs-snekstudio-source
 Build-Depends: debhelper-compat (= 13), cmake, pkg-config, libobs-dev, python3
 Standards-Version: 4.7.0
 Rules-Requires-Root: no

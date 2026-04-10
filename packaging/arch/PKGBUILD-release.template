@@ -1,21 +1,21 @@
-# Maintainer: Your Name <address at domain dot tld>
+# Maintainer: Jean-Cedric Therond <jean.cedric.t+github@gmail.com>
 
 pkgname=obs-snekstudio-source
 pkgver=0.1.0
 pkgrel=1
 pkgdesc='OBS Studio plugin and demo publisher for cooperative SnekStudio capture'
 arch=('x86_64')
-url='https://example.invalid/replace-with-upstream-homepage'
-license=('REPLACE_WITH_UPSTREAM_SPDX')
+url='https://github.com/kane-thornwyrd/obs-snekstudio-source'
+license=('GPL-3.0-or-later')
 depends=('obs-studio' 'python')
-makedepends=('cmake' 'obs-studio' 'pkgconf')
+makedepends=('cmake' 'pkgconf')
 conflicts=('obs-snekstudio-source-git')
 install='obs-snekstudio-source.install'
-_archive_url='https://example.invalid/replace-with-release-archive/v0.1.0.tar.gz'
-source=("${pkgname}-${pkgver}.tar.gz::${_archive_url}")
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
 sha256sums=('REPLACE_WITH_REAL_SHA256')
 
 build() {
+	rm -rf build
 	cmake -S "${srcdir}/${pkgname}-${pkgver}" \
 		-B build \
 		-DCMAKE_BUILD_TYPE=None \
@@ -25,8 +25,4 @@ build() {
 
 package() {
 	DESTDIR="${pkgdir}" cmake --install build
-
-	# If upstream ships a non-common license file, install it here.
-	# Example:
-	# install -Dm644 LICENSE -t "${pkgdir}/usr/share/licenses/${pkgname}/"
 }

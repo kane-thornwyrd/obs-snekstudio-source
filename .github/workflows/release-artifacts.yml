@@ -1,0 +1,154 @@
+name: Release Artifacts
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-artifacts-${{ github.ref_name || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build-release-artifacts:
+    name: Build Release Artifacts
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Arch build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel \
+            cmake \
+            git \
+            obs-studio \
+            pkgconf \
+            python
+
+      - name: Resolve release metadata
+        id: meta
+        run: |
+          set -euo pipefail
+
+          version="$(tr -d '\n' < VERSION)"
+          tag="v${version}"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            if [[ "${GITHUB_REF_NAME}" != "${tag}" ]]; then
+              echo "VERSION=${version} does not match pushed tag ${GITHUB_REF_NAME}" >&2
+              exit 1
+            fi
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create non-root build user
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "${GITHUB_WORKSPACE}"
+
+      - name: Build staged install bundle
+        run: |
+          runuser -u builder -- bash -lc '
+            set -euo pipefail
+            cd "$GITHUB_WORKSPACE"
+            rm -rf build release
+            mkdir -p release/stage release/assets
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build
+            cmake --install build --prefix "$GITHUB_WORKSPACE/release/stage"
+          '
+
+      - name: Build source tarball and Arch package
+        run: |
+          runuser -u builder -- bash -lc '
+            set -euo pipefail
+            cd "$GITHUB_WORKSPACE"
+            ./scripts/create_source_tarball.sh
+            rm -f "packaging/arch/obs-snekstudio-source-${{ steps.meta.outputs.version }}.tar.gz"
+            rm -f packaging/arch/*.pkg.tar.zst packaging/arch/*.pkg.tar.zst.sig
+            pushd packaging/arch >/dev/null
+            makepkg -f --nodeps
+            popd >/dev/null
+          '
+
+      - name: Assemble release assets
+        run: |
+          set -euo pipefail
+
+          asset_dir="${GITHUB_WORKSPACE}/release/assets"
+          version="${{ steps.meta.outputs.version }}"
+
+          cp \
+            "${GITHUB_WORKSPACE}/dist/obs-snekstudio-source-${version}.tar.gz" \
+            "${asset_dir}/obs-snekstudio-source-${version}-source.tar.gz"
+
+          tar \
+            -C "${GITHUB_WORKSPACE}/release/stage" \
+            -czf "${asset_dir}/obs-snekstudio-source-${version}-linux-stage.tar.gz" \
+            .
+
+          find "${GITHUB_WORKSPACE}/packaging/arch" -maxdepth 1 -name '*.pkg.tar.zst' -exec cp {} "${asset_dir}/" \;
+
+          (
+            cd "${asset_dir}"
+            sha256sum * > SHA256SUMS.txt
+          )
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ steps.meta.outputs.version }}
+          path: ${{ github.workspace }}/release/assets/*
+          if-no-files-found: error
+
+  publish-release-assets:
+    name: Publish Release Assets
+    runs-on: ubuntu-latest
+    needs:
+      - build-release-artifacts
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-${{ needs.build-release-artifacts.outputs.version }}
+          path: release-assets
+
+      - name: Create GitHub release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="${{ needs.build-release-artifacts.outputs.tag }}"
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            gh release create \
+              "${tag}" \
+              --target "${GITHUB_SHA}" \
+              --title "${tag}" \
+              --generate-notes \
+              --notes "$(cat .github/release-notes.md)"
+          fi
+
+      - name: Upload assets to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ needs.build-release-artifacts.outputs.tag }}" release-assets/* --clobber

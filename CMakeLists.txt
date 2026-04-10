@@ -73,6 +73,10 @@ install(PROGRAMS scripts/snekstudio_demo_publisher.py
     RENAME snekstudio-demo-publisher
 )
 
+install(FILES LICENSE
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/${SNEKSTUDIO_PACKAGE_NAME}
+)
+
 install(FILES MVP.md SPEC.md
     DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/${SNEKSTUDIO_PACKAGE_NAME}
 )

@@ -1,0 +1,13 @@
+Publishes the final SnekStudio viewport to the shared frame file used by the
+OBS SnekStudio Source MVP.
+
+This external mod captures the root viewport in GDScript and writes the shared
+frame protocol directly to disk. It can either follow the live viewport size
+or publish a fixed output resolution for a more stable OBS source size.
+
+Notes:
+- It will capture whatever the root viewport is currently rendering.
+- If the SnekStudio UI is visible, it may also appear in the captured frame.
+- The OBS-side plugin accepts RGBA8 directly, so this mod avoids an extra
+  per-pixel swizzle pass in GDScript.
+- Lowering the publish FPS can significantly reduce the viewport capture cost.

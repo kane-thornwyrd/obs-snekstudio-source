@@ -2,6 +2,8 @@
 
 SnekStudio OBSFramePublisher is a SnekStudio runtime mod for Godot 4.6. It publishes the rendered SnekStudio viewport to the shared framebuffer consumed by the companion OBS source plugin.
 
+This asset is intended for SnekStudio projects. It depends on SnekStudio's existing runtime mod API and is not a standalone generic Godot addon.
+
 ## Requirements
 
 - Godot 4.6
@@ -35,6 +37,7 @@ After installation:
 - The root viewport is captured, so visible SnekStudio UI may appear in the output.
 - The default output path is `$XDG_RUNTIME_DIR/snekstudio-source/demo-framebuffer.bin`.
 - This asset is intended for SnekStudio projects and does not modify SnekStudio engine code.
+- The companion OBS source plugin is distributed separately from this Asset Library package.
 
 ## License
 
